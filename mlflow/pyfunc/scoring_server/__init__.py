@@ -20,7 +20,9 @@ import logging
 import os
 import shlex
 import sys
+import time as time_module
 import traceback
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, NamedTuple
 
@@ -389,13 +391,38 @@ def invocations(data, content_type, model, input_schema):
     # Do the prediction
     # NB: utils._validate_serving_input mimic the scoring process here to validate input_example
     # work for serving, so any changes here should be reflected there as well
+    predict_start_wall = datetime.now(timezone.utc)
+    predict_start_mono = time_module.monotonic()
+    _logger.debug(
+        "[TRACE_DEBUG] invocations model.predict START | wall_clock=%s | "
+        "content_type=%s",
+        predict_start_wall.isoformat(),
+        content_type,
+    )
     try:
         if "params" in inspect.signature(model.predict).parameters:
             raw_predictions = model.predict(data, params=params)
         else:
             _log_warning_if_params_not_in_predict_signature(_logger, params)
             raw_predictions = model.predict(data)
+        predict_elapsed_ms = (time_module.monotonic() - predict_start_mono) * 1000
+        _logger.debug(
+            "[TRACE_DEBUG] invocations model.predict COMPLETED | wall_clock=%s | "
+            "started_at=%s | elapsed_ms=%.1f",
+            datetime.now(timezone.utc).isoformat(),
+            predict_start_wall.isoformat(),
+            predict_elapsed_ms,
+        )
     except MlflowException as e:
+        predict_elapsed_ms = (time_module.monotonic() - predict_start_mono) * 1000
+        _logger.debug(
+            "[TRACE_DEBUG] invocations model.predict FAILED (MlflowException) | "
+            "wall_clock=%s | started_at=%s | elapsed_ms=%.1f | error=%s",
+            datetime.now(timezone.utc).isoformat(),
+            predict_start_wall.isoformat(),
+            predict_elapsed_ms,
+            str(e)[:200],
+        )
         if "Failed to enforce schema" in e.message:
             _logger.warning(
                 "If using `instances` as input key, we internally convert "
@@ -406,7 +433,18 @@ def invocations(data, content_type, model, input_schema):
             )
         e.message = f"Failed to predict data '{data}'. \nError: {e.message}"
         raise e
-    except Exception:
+    except Exception as exc:
+        predict_elapsed_ms = (time_module.monotonic() - predict_start_mono) * 1000
+        _logger.debug(
+            "[TRACE_DEBUG] invocations model.predict FAILED (Exception) | "
+            "wall_clock=%s | started_at=%s | elapsed_ms=%.1f | "
+            "exception_type=%s | error=%s",
+            datetime.now(timezone.utc).isoformat(),
+            predict_start_wall.isoformat(),
+            predict_elapsed_ms,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
         raise MlflowException(
             message=(
                 "Encountered an unexpected error while evaluating the model. Verify"
@@ -499,9 +537,39 @@ def init(model: PyFuncModel):
 
     @app.middleware("http")
     async def timeout_middleware(request: Request, call_next):
+        request_start_wall = datetime.now(timezone.utc)
+        request_start_mono = time_module.monotonic()
+        _logger.debug(
+            "[TRACE_DEBUG] timeout_middleware REQUEST START | wall_clock=%s | "
+            "path=%s | timeout_config=%s",
+            request_start_wall.isoformat(),
+            request.url.path,
+            timeout,
+        )
         try:
-            return await asyncio.wait_for(call_next(request), timeout=timeout)
+            response = await asyncio.wait_for(call_next(request), timeout=timeout)
+            elapsed_ms = (time_module.monotonic() - request_start_mono) * 1000
+            _logger.debug(
+                "[TRACE_DEBUG] timeout_middleware REQUEST COMPLETED | wall_clock=%s | "
+                "path=%s | elapsed_ms=%.1f | status=%s",
+                datetime.now(timezone.utc).isoformat(),
+                request.url.path,
+                elapsed_ms,
+                response.status_code,
+            )
+            return response
         except (asyncio.TimeoutError, TimeoutError):
+            elapsed_ms = (time_module.monotonic() - request_start_mono) * 1000
+            _logger.debug(
+                "[TRACE_DEBUG] timeout_middleware TIMEOUT | wall_clock=%s | "
+                "path=%s | request_started_at=%s | elapsed_ms=%.1f | "
+                "timeout_config=%s",
+                datetime.now(timezone.utc).isoformat(),
+                request.url.path,
+                request_start_wall.isoformat(),
+                elapsed_ms,
+                timeout,
+            )
             return Response(
                 content="Request processing time exceeded limit",
                 status_code=504,

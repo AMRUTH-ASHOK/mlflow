@@ -2,6 +2,7 @@ import contextlib
 import logging
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Generator, Sequence
 
 from mlflow.entities import LiveSpan, Trace, TraceData, TraceInfo
@@ -88,6 +89,19 @@ class InMemoryTraceManager:
         """
         # Check for a new timeout setting whenever a new trace is created.
         self._check_timeout_update()
+        wall_clock = datetime.now(timezone.utc).isoformat()
+        _logger.debug(
+            "[TRACE_DEBUG] TraceManager.register_trace | wall_clock=%s | "
+            "trace_id=%s | otel_trace_id=%s | request_time=%s | "
+            "client_request_id=%s | cache_type=%s | cache_size=%d",
+            wall_clock,
+            trace_info.trace_id,
+            otel_trace_id,
+            trace_info.request_time,
+            trace_info.client_request_id,
+            type(self._traces).__name__,
+            len(self._traces),
+        )
         with self._lock:
             self._traces[trace_info.trace_id] = _Trace(trace_info, is_remote_trace=is_remote_trace)
             self._otel_id_to_mlflow_trace_id[otel_trace_id] = trace_info.trace_id
@@ -180,11 +194,36 @@ class InMemoryTraceManager:
         Pop trace data for the given OpenTelemetry trace ID and
         return it as a ManagerTrace wrapper containing the trace and prompts.
         """
+        wall_clock = datetime.now(timezone.utc).isoformat()
         with self._lock:
             mlflow_trace_id = self._otel_id_to_mlflow_trace_id.pop(otel_trace_id, None)
             internal_trace = self._traces.pop(mlflow_trace_id, None) if mlflow_trace_id else None
             if internal_trace is None:
+                _logger.debug(
+                    "[TRACE_DEBUG] TraceManager.pop_trace NOT FOUND | wall_clock=%s | "
+                    "otel_trace_id=%s | mlflow_trace_id=%s | "
+                    "remaining_traces=%d | remaining_otel_ids=%d",
+                    wall_clock,
+                    otel_trace_id,
+                    mlflow_trace_id,
+                    len(self._traces),
+                    len(self._otel_id_to_mlflow_trace_id),
+                )
                 return None
+            _logger.debug(
+                "[TRACE_DEBUG] TraceManager.pop_trace FOUND | wall_clock=%s | "
+                "otel_trace_id=%s | mlflow_trace_id=%s | "
+                "request_time=%s | execution_duration=%s | "
+                "num_spans=%d | state=%s | client_request_id=%s",
+                wall_clock,
+                otel_trace_id,
+                mlflow_trace_id,
+                internal_trace.info.request_time,
+                internal_trace.info.execution_duration,
+                len(internal_trace.span_dict),
+                internal_trace.info.state,
+                internal_trace.info.client_request_id,
+            )
             return ManagerTrace(
                 trace=internal_trace.to_mlflow_trace(),
                 prompts=internal_trace.prompts,

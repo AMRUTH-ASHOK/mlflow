@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from cachetools import TTLCache
@@ -27,10 +28,28 @@ def pop_trace(request_id: str) -> dict[str, Any] | None:
     Pop the completed trace data from the buffer. This method is used in
     the Databricks model serving so please be careful when modifying it.
     """
+    wall_clock = datetime.now(timezone.utc).isoformat()
     if request_id not in _TRACE_BUFFER:
         _logger.debug(
-            f"Request ID {request_id} not found in TRACE_BUFFER, "
-            f"available request IDs: {_TRACE_BUFFER.keys()}"
+            "[TRACE_DEBUG] pop_trace NOT FOUND | wall_clock=%s | request_id=%s | "
+            "available_request_ids=%s",
+            wall_clock,
+            request_id,
+            list(_TRACE_BUFFER.keys()),
+        )
+    else:
+        trace_dict = _TRACE_BUFFER.get(request_id)
+        trace_info = trace_dict.get("info", {}) if isinstance(trace_dict, dict) else {}
+        _logger.debug(
+            "[TRACE_DEBUG] pop_trace FOUND | wall_clock=%s | request_id=%s | "
+            "trace_request_time=%s | trace_execution_duration=%s | "
+            "trace_state=%s | num_spans=%s",
+            wall_clock,
+            request_id,
+            trace_info.get("request_time"),
+            trace_info.get("execution_duration"),
+            trace_info.get("state"),
+            len(trace_dict.get("data", {}).get("spans", [])) if isinstance(trace_dict, dict) else "N/A",
         )
     return _TRACE_BUFFER.pop(request_id, None)
 
@@ -93,6 +112,27 @@ class InferenceTableSpanExporter(SpanExporter):
             trace = manager_trace.trace
             _set_last_active_trace_id(trace.info.trace_id)
 
+            wall_clock_export = datetime.now(timezone.utc).isoformat()
+            request_time_iso = (
+                datetime.fromtimestamp(trace.info.request_time / 1000, tz=timezone.utc).isoformat()
+                if trace.info.request_time
+                else "None"
+            )
+            _logger.debug(
+                "[TRACE_DEBUG] export ADD TO BUFFER | wall_clock=%s | "
+                "client_request_id=%s | trace_id=%s | "
+                "request_time_ms=%s (=%s) | execution_duration_ms=%s | "
+                "state=%s | num_spans=%d",
+                wall_clock_export,
+                trace.info.client_request_id,
+                trace.info.trace_id,
+                trace.info.request_time,
+                request_time_iso,
+                trace.info.execution_duration,
+                trace.info.state,
+                len(trace.data.spans),
+            )
+
             # Add the trace to the in-memory buffer so it can be retrieved by upstream
             # The key is Databricks request ID.
             _TRACE_BUFFER[trace.info.client_request_id] = trace.to_dict()
@@ -125,8 +165,37 @@ class InferenceTableSpanExporter(SpanExporter):
     def _log_trace_to_mlflow_backend(self, trace: Trace, prompts: Sequence[PromptVersion]):
         add_size_stats_to_trace_metadata(trace)
 
+        wall_clock_before = datetime.now(timezone.utc).isoformat()
+        request_time_iso = (
+            datetime.fromtimestamp(trace.info.request_time / 1000, tz=timezone.utc).isoformat()
+            if trace.info.request_time
+            else "None"
+        )
+        _logger.debug(
+            "[TRACE_DEBUG] _log_trace_to_mlflow_backend BEFORE start_trace | "
+            "wall_clock=%s | trace_id=%s | request_time_ms=%s (=%s) | "
+            "execution_duration_ms=%s | state=%s | num_spans=%d",
+            wall_clock_before,
+            trace.info.trace_id,
+            trace.info.request_time,
+            request_time_iso,
+            trace.info.execution_duration,
+            trace.info.state,
+            len(trace.data.spans),
+        )
+
         returned_trace_info = self._client.start_trace(trace.info)
         self._client._upload_trace_data(returned_trace_info, trace.data)
+
+        _logger.debug(
+            "[TRACE_DEBUG] _log_trace_to_mlflow_backend AFTER start_trace | "
+            "wall_clock=%s | returned_trace_id=%s | returned_request_time=%s | "
+            "returned_execution_duration=%s",
+            datetime.now(timezone.utc).isoformat(),
+            returned_trace_info.trace_id,
+            returned_trace_info.request_time,
+            returned_trace_info.execution_duration,
+        )
 
         # Link prompt versions to the trace. Prompt linking is not critical for trace export
         # (if the prompt fails to link, the user's workflow is minorly affected), so we handle

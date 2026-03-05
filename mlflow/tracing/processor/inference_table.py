@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan as OTelReadableSpan
@@ -67,6 +68,16 @@ class InferenceTableSpanProcessor(SimpleSpanProcessor):
                 span is obtained from the global context, it won't be passed here so we should not
                 rely on it.
         """
+        wall_clock_on_start = datetime.now(timezone.utc)
+        _logger.debug(
+            "[TRACE_DEBUG] on_start ENTER | wall_clock=%s | span_name=%s | "
+            "is_root=%s | span_start_time_ns=%d",
+            wall_clock_on_start.isoformat(),
+            span.name,
+            span._parent is None,
+            span.start_time,
+        )
+
         databricks_request_id = maybe_get_request_id()
         if databricks_request_id is None:
             # NB: This is currently used for streaming inference in Databricks Model Serving.
@@ -97,6 +108,19 @@ class InferenceTableSpanProcessor(SimpleSpanProcessor):
             tags.update(dependencies_schema)
 
         if span._parent is None:
+            request_time_ms = span.start_time // 1_000_000
+            _logger.debug(
+                "[TRACE_DEBUG] on_start ROOT SPAN | wall_clock=%s | "
+                "request_time_ms=%d (=%s) | databricks_request_id=%s | "
+                "trace_id=%s | otel_trace_id=%s | span_start_time_ns=%d",
+                wall_clock_on_start.isoformat(),
+                request_time_ms,
+                datetime.fromtimestamp(request_time_ms / 1000, tz=timezone.utc).isoformat(),
+                databricks_request_id,
+                trace_id,
+                span.context.trace_id,
+                span.start_time,
+            )
             trace_info = TraceInfo(
                 trace_id=trace_id,
                 client_request_id=databricks_request_id,
@@ -105,13 +129,22 @@ class InferenceTableSpanProcessor(SimpleSpanProcessor):
                 #   _get_experiment_id() method because it will fallback to the default
                 #   experiment if the MLFLOW_EXPERIMENT_ID is not set.
                 trace_location=TraceLocation.from_experiment_id(MLFLOW_EXPERIMENT_ID.get()),
-                request_time=span.start_time // 1_000_000,  # nanosecond to millisecond
+                request_time=request_time_ms,
                 execution_duration=None,
                 state=TraceState.IN_PROGRESS,
                 trace_metadata=self._get_trace_metadata(),
                 tags=tags,
             )
             self._trace_manager.register_trace(span.context.trace_id, trace_info)
+        else:
+            _logger.debug(
+                "[TRACE_DEBUG] on_start CHILD SPAN | wall_clock=%s | "
+                "span_name=%s | trace_id=%s | databricks_request_id=%s",
+                wall_clock_on_start.isoformat(),
+                span.name,
+                trace_id,
+                databricks_request_id,
+            )
 
         self._trace_manager.register_span(create_mlflow_span(span, trace_id))
 
@@ -122,17 +155,59 @@ class InferenceTableSpanProcessor(SimpleSpanProcessor):
         Args:
             span: An OpenTelemetry ReadableSpan object that is ended.
         """
+        wall_clock_on_end = datetime.now(timezone.utc)
+
         # Processing the trace only when the root span is found.
         if span._parent is not None:
+            _logger.debug(
+                "[TRACE_DEBUG] on_end CHILD SPAN | wall_clock=%s | span_name=%s | "
+                "span_start_ns=%d | span_end_ns=%d | duration_ms=%d",
+                wall_clock_on_end.isoformat(),
+                span.name,
+                span.start_time,
+                span.end_time,
+                (span.end_time - span.start_time) // 1_000_000,
+            )
             return
 
         trace_id = get_otel_attribute(span, SpanAttributeKey.REQUEST_ID)
+        execution_duration_ms = (span.end_time - span.start_time) // 1_000_000
+        _logger.debug(
+            "[TRACE_DEBUG] on_end ROOT SPAN | wall_clock=%s | trace_id=%s | "
+            "span_start_ns=%d (=%s) | span_end_ns=%d (=%s) | "
+            "execution_duration_ms=%d | span_status=%s",
+            wall_clock_on_end.isoformat(),
+            trace_id,
+            span.start_time,
+            datetime.fromtimestamp(span.start_time / 1e9, tz=timezone.utc).isoformat(),
+            span.end_time,
+            datetime.fromtimestamp(span.end_time / 1e9, tz=timezone.utc).isoformat(),
+            execution_duration_ms,
+            span.status,
+        )
+
         with self._trace_manager.get_trace(trace_id) as trace:
             if trace is None:
-                _logger.debug(f"Trace data with trace ID {trace_id} not found.")
+                _logger.debug(
+                    "[TRACE_DEBUG] on_end ROOT SPAN TRACE NOT FOUND | wall_clock=%s | "
+                    "trace_id=%s — trace was likely already expired/popped",
+                    wall_clock_on_end.isoformat(),
+                    trace_id,
+                )
                 return
 
-            trace.info.execution_duration = (span.end_time - span.start_time) // 1_000_000
+            trace.info.execution_duration = execution_duration_ms
+            _logger.debug(
+                "[TRACE_DEBUG] on_end ROOT SPAN trace_info UPDATED | wall_clock=%s | "
+                "trace_id=%s | request_time=%s | execution_duration=%d | "
+                "num_spans=%d | state=%s",
+                wall_clock_on_end.isoformat(),
+                trace_id,
+                trace.info.request_time,
+                trace.info.execution_duration,
+                len(trace.span_dict),
+                trace.info.state,
+            )
 
             # Update trace state from span status, but only if the user hasn't explicitly set
             # a different trace status

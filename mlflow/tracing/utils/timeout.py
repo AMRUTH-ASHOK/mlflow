@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 
 from cachetools import Cache, TTLCache
 
@@ -206,23 +207,66 @@ class MlflowTraceTimeoutCache(_TimedCache):
         """
         expired = self._get_expired_traces()
 
+        if expired:
+            wall_clock = datetime.now(timezone.utc).isoformat()
+            _logger.debug(
+                "[TRACE_DEBUG] TimeoutCache.expire | wall_clock=%s | "
+                "num_expired=%d | expired_ids=%s | timeout_seconds=%d | cache_size=%d",
+                wall_clock,
+                len(expired),
+                expired,
+                self._timeout,
+                len(self),
+            )
+
         # End the expired traces and set the status to ERROR in background thread
         for request_id in expired:
             trace = self[request_id]
-            if root_span := trace.get_root_span():
+            root_span = trace.get_root_span()
+            _logger.debug(
+                "[TRACE_DEBUG] TimeoutCache.expire PROCESSING | wall_clock=%s | "
+                "request_id=%s | has_root_span=%s | request_time=%s | "
+                "execution_duration=%s | num_spans=%d | state=%s",
+                datetime.now(timezone.utc).isoformat(),
+                request_id,
+                root_span is not None,
+                trace.info.request_time,
+                trace.info.execution_duration,
+                len(trace.span_dict),
+                trace.info.state,
+            )
+            if root_span:
                 try:
                     root_span.set_status(SpanStatusCode.ERROR)
                     msg = _TRACE_EXPIRATION_MSG.format(request_id=request_id, ttl=self._timeout)
                     exception_event = SpanEvent.from_exception(MlflowTracingException(msg))
                     root_span.add_event(exception_event)
+                    _logger.debug(
+                        "[TRACE_DEBUG] TimeoutCache.expire CALLING root_span.end() | "
+                        "wall_clock=%s | request_id=%s",
+                        datetime.now(timezone.utc).isoformat(),
+                        request_id,
+                    )
                     root_span.end()  # Calling end() triggers span export
                     _logger.info(msg + " You can find the aborted trace in the MLflow UI.")
                 except Exception as e:
-                    _logger.debug(f"Failed to export an expired trace {request_id}: {e}")
+                    _logger.debug(
+                        "[TRACE_DEBUG] TimeoutCache.expire FAILED | wall_clock=%s | "
+                        "request_id=%s | error=%s",
+                        datetime.now(timezone.utc).isoformat(),
+                        request_id,
+                        e,
+                    )
 
                 # NB: root_span.end() should pop the trace from the cache. But we need to
                 # double-check it because it may not happens due to some errors.
                 if request_id in self:
+                    _logger.debug(
+                        "[TRACE_DEBUG] TimeoutCache.expire CLEANUP | wall_clock=%s | "
+                        "request_id=%s still in cache after end(), manually deleting",
+                        datetime.now(timezone.utc).isoformat(),
+                        request_id,
+                    )
                     del self[request_id]
 
     def _get_expired_traces(self) -> list[str]:
@@ -242,6 +286,18 @@ class MlflowTraceTimeoutCache(_TimedCache):
         while curr is not self._root and not (time < curr.expires):
             expired.append(curr.key)
             curr = curr.next
+
+        if expired:
+            _logger.debug(
+                "[TRACE_DEBUG] TimeoutCache._get_expired_traces | wall_clock=%s | "
+                "current_monotonic=%.3f | num_checked=%d | num_expired=%d | "
+                "expired_ids=%s",
+                datetime.now(timezone.utc).isoformat(),
+                time,
+                len(self._links),
+                len(expired),
+                expired,
+            )
         return expired
 
     def clear(self):
